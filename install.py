@@ -166,7 +166,7 @@ def manifest(specs, view, store, compiler_mixing=None):
 
 
 def stack_manifest(compiler, specs, compiler_view, stack_view, store, compiler_mixing,
-                   reuse_specs, externals, bootstrap=None):
+                   reuse_specs, externals, blas, bootstrap=None):
     lines = ["spack:", "  specs:"]
     if bootstrap:
         lines += [
@@ -213,6 +213,7 @@ def stack_manifest(compiler, specs, compiler_view, stack_view, store, compiler_m
         "    mesa:",
         '      require: "~llvm"',
     ]
+    lines += blas
     if bootstrap is None:
         lines += [
             "    gcc:",
@@ -239,12 +240,12 @@ def stack_manifest(compiler, specs, compiler_view, stack_view, store, compiler_m
     return "\n".join(lines)
 
 
-def dependency_specs(dependencies, mpi, compiler, blas):
+def dependency_specs(dependencies, mpi, compiler):
     compiled_with = f"%{compiler}"
     mpi_dep = f"^mpich@{mpi}"
     specs = [
         f"googletest@{dependencies['googletest']} {compiled_with}",
-        f"mpich@{mpi}+fortran {compiled_with}",
+        f"mpich@{mpi}~fortran {compiled_with}",
         f"mpicpp-lite@{dependencies['mpicpp-lite']} {compiled_with} {mpi_dep}",
         f"boost@{dependencies['boost']} {compiled_with}",
         f"hdf5@{dependencies['hdf5']}+hl+mpi {compiled_with} {mpi_dep}",
@@ -257,18 +258,38 @@ def dependency_specs(dependencies, mpi, compiler, blas):
         f"petsc@{dependencies['petsc']}+mpi+double~complex+int64+hdf5+metis+ptscotch"
         f"+hypre+superlu-dist~fortran {compiled_with} {mpi_dep} "
         f"^hdf5@{dependencies['hdf5']} ^hypre@{dependencies['hypre']} "
-        f"^superlu-dist@{dependencies['superlu-dist']} "
+        f"^superlu-dist@{dependencies['superlu-dist']}~fortran "
         f"^metis@{dependencies['metis']} ^parmetis@{dependencies['parmetis']} "
-        f"^scotch@{dependencies['scotch']} {blas}"
+        f"^scotch@{dependencies['scotch']}~fortran"
     )
     return specs + [petsc]
+
+
+def blas_packages(dependencies):
+    """Require oneMKL on x86_64, where it exists, and OpenBLAS on other targets."""
+    mkl = "^[virtuals=blas,lapack] intel-oneapi-mkl"
+    openblas = "^[virtuals=blas,lapack] openblas"
+    lines = [
+        "    intel-oneapi-mkl:",
+        f'      require: "@{dependencies["intel-oneapi-mkl"]}"',
+        "    openblas:",
+        f'      require: "@{dependencies["openblas"]}~fortran"',
+    ]
+    for name in ("petsc", "hypre", "superlu-dist"):
+        lines += [
+            f"    {name}:",
+            "      require:",
+            f'      - one_of: ["{mkl}", "{openblas}"]',
+            f'      - spec: "{mkl}"',
+            '        when: "target=x86_64:"',
+        ]
+    return lines
 
 
 def modulefile(family, release, mpi, compiler_view, gcc_runtime_view, view, common_view,
                common_venv, stack_venv, python):
     cc, cxx = {"gcc": ("gcc", "g++"), "clang": ("clang", "clang++"),
                "oneapi": ("icx", "icpx")}[family]
-    fc = {"gcc": "gfortran", "clang": "flang", "oneapi": "ifx"}[family]
     compiler_bin = (compiler_view / "compiler" / "latest" / "bin"
                     if family == "oneapi" else compiler_view / "bin")
     py = ".".join(python.split(".")[:2])
@@ -280,12 +301,9 @@ def modulefile(family, release, mpi, compiler_view, gcc_runtime_view, view, comm
         f"setenv OPENSN_STACK {view}",
         f"setenv CC {compiler_bin}/{cc}",
         f"setenv CXX {compiler_bin}/{cxx}",
-        f"setenv FC {compiler_bin}/{fc}",
-        f"setenv F77 {compiler_bin}/{fc}",
         f"setenv MPI_HOME {view}",
         f"setenv MPICC {view}/bin/mpicc",
         f"setenv MPICXX {view}/bin/mpicxx",
-        f"setenv MPIFC {view}/bin/mpifort",
         f"setenv PETSC_DIR {view}",
         f"setenv VIRTUAL_ENV {stack_venv}",
         f"setenv Python3_EXECUTABLE {stack_venv}/bin/python",
@@ -337,14 +355,20 @@ def generate(config):
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         "[[ $(uname -s) == Linux ]] || { echo 'Linux is required' >&2; exit 1; }",
-        "command -v git >/dev/null; command -v python3 >/dev/null",
+        "command -v git >/dev/null; command -v python3 >/dev/null; command -v flock >/dev/null",
         f"mkdir -p {quote(private)} {quote(config['work'])}",
+        f"exec 9>{quote(private / 'install.lock')}",
+        ("flock -n 9 || { echo 'Another OpenSn toolchain install is using "
+         f"{root}' >&2; exit 1; }}"),
         f"if [[ ! -x {quote(source / 'bin/spack')} ]]; then",
         clone,
         "fi",
         f"export SPACK_USER_CONFIG_PATH={quote(private / 'config')}",
         f"export SPACK_USER_CACHE_PATH={quote(private / 'cache')}",
         f"spack={quote(source / 'bin/spack')}",
+        '"$spack" config --scope user remove config:build_stage >/dev/null 2>&1 || true',
+        ('"$spack" config --scope user add '
+         f'{quote("config:build_stage:[" + str(Path(config["work"]) / "spack-stage") + "]")}'),
         f'"$spack" repo update --commit {quote(config["spack"]["packages_ref"])} builtin',
         '"$spack" repo remove opensn >/dev/null 2>&1 || true',
         f'"$spack" repo add {quote(PROJECT / "spack")}',
@@ -413,62 +437,66 @@ def generate(config):
             ("gmake", f'gmake@{config["dependencies"]["gmake"]}', python_view, None),
         ]
         if family == "gcc":
-            compiler = f"gcc@{release} languages:=c,c++,fortran"
+            compiler = f"gcc@{release} languages:=c,c++"
             compiler_ref = f"gcc@{release}"
-            blas = f"^openblas@{config['dependencies']['openblas']}"
             bootstrap = None
             reuse_specs = [f"gcc@{release}", f"%gcc@{release}"]
             compiler_mixing = False
         elif family == "clang":
             targets = "x86,nvptx" if config["clang_ptx"] else "x86"
             bootstrap = (f"gcc@{item['gcc_toolchain']} "
-                         "languages:=c,c++,fortran")
+                         "languages:=c,c++")
             bootstrap_view = root / "compilers" / "gcc" / item["gcc_toolchain"] / "view"
             gcc_release = item["gcc_toolchain"]
             reuse_specs = [f"gcc@{gcc_release}", f"%gcc@{gcc_release}",
                            f"llvm@{release}", f"%llvm@{release}"]
             externals.append((
-                "gcc", f"gcc@{gcc_release} languages='c,c++,fortran'", bootstrap_view,
-                {"c": bootstrap_view / "bin/gcc", "cxx": bootstrap_view / "bin/g++",
-                 "fortran": bootstrap_view / "bin/gfortran"},
+                "gcc", f"gcc@{gcc_release} languages='c,c++'", bootstrap_view,
+                {"c": bootstrap_view / "bin/gcc", "cxx": bootstrap_view / "bin/g++"},
             ))
-            compiler = (f"llvm@{release}+clang+lld+lldb+flang openmp=runtime "
+            compiler = (f"llvm@{release}+clang+lld+lldb~flang openmp=runtime "
                         f"targets:={targets} %gcc@{item['gcc_toolchain']}")
             compiler_ref = f"llvm@{release}"
-            blas = f"^openblas@{config['dependencies']['openblas']}"
             compiler_mixing = False
         else:
             bootstrap = (f"gcc@{item['gcc_toolchain']} "
-                         "languages:=c,c++,fortran")
+                         "languages:=c,c++")
             bootstrap_view = root / "compilers" / "gcc" / item["gcc_toolchain"] / "view"
             gcc_release = item["gcc_toolchain"]
             reuse_specs = [f"gcc@{gcc_release}", f"%gcc@{gcc_release}",
                            f"intel-oneapi-compilers@{release}",
                            f"%intel-oneapi-compilers@{release}"]
             externals.append((
-                "gcc", f"gcc@{gcc_release} languages='c,c++,fortran'", bootstrap_view,
-                {"c": bootstrap_view / "bin/gcc", "cxx": bootstrap_view / "bin/g++",
-                 "fortran": bootstrap_view / "bin/gfortran"},
+                "gcc", f"gcc@{gcc_release} languages='c,c++'", bootstrap_view,
+                {"c": bootstrap_view / "bin/gcc", "cxx": bootstrap_view / "bin/g++"},
             ))
             compiler = f"intel-oneapi-compilers@{release} %gcc@{item['gcc_toolchain']}"
             compiler_ref = f"intel-oneapi-compilers@{release}"
-            blas = f"^intel-oneapi-mkl@{config['dependencies']['intel-oneapi-mkl']}"
             compiler_mixing = False
-        specs = dependency_specs(config["dependencies"], mpi, compiler_ref, blas)
+        specs = dependency_specs(config["dependencies"], mpi, compiler_ref)
         if bootstrap_view:
-            tools = [bootstrap_view / "bin" / name for name in ("gcc", "g++", "gfortran")]
+            tools = [bootstrap_view / "bin" / name for name in ("gcc", "g++")]
             checks = " && ".join(f"[[ -x {quote(path)} ]]" for path in tools)
             lines.append(f"{checks} || {{ echo 'Missing GCC bootstrap view: "
                          f"{bootstrap_view}' >&2; exit 1; }}")
         add_file(lines, stack_env / "spack.yaml",
                  stack_manifest(compiler, specs, compiler_view, view, store,
-                                compiler_mixing, reuse_specs, externals, bootstrap))
+                                compiler_mixing, reuse_specs, externals,
+                                blas_packages(config["dependencies"]), bootstrap))
         mpi_test = ("import h5py, numpy; assert not h5py.get_config().mpi; "
                     "from mpi4py import MPI; assert MPI.COMM_WORLD.size == 2; "
                     "assert 'MPICH' in MPI.Get_library_version()")
         label = f"{family} {release} / MPICH {mpi}"
         lines += [f"echo '==> Concretizing {label}'",
-                  f'"$spack" -e {quote(stack_env)} concretize -f',
+                  f'"$spack" -e {quote(stack_env)} concretize -f']
+        # Intel's offline installers clean up files under /tmp/$USER, including other packages'
+        # Spack stages, so each one is installed while no other build is running.
+        if family == "oneapi":
+            lines.append(f'"$spack" -e {quote(stack_env)} install --only-concrete '
+                         'intel-oneapi-compilers')
+        lines += ['if [[ $(uname -m) == x86_64 ]]; then',
+                  f'"$spack" -e {quote(stack_env)} install --only-concrete intel-oneapi-mkl',
+                  "fi",
                   f"echo '==> Installing {label}'",
                   f'"$spack" -e {quote(stack_env)} install -j {config["jobs"]}',
                   f'"$spack" -e {quote(stack_env)} env view regenerate',
