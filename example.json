@@ -1,0 +1,39 @@
+{
+  "root": "/opt/local",
+  "work": "/tmp/opensn-toolchains",
+  "jobs": 64,
+  "python": "3.13.13",
+  "mpich": "5.0.2",
+  "spack": {
+    "url": "https://github.com/spack/spack.git",
+    "ref": "v1.2.2",
+    "packages_ref": "19c15b598f462517e2d091baa65a86a53c7d36a9"
+  },
+  "clang_ptx": true,
+  "docs": true,
+  "dependencies": {
+    "cmake": "3.31.12",
+    "gmake": "4.4.1",
+    "doxygen": "1.17.0",
+    "pandoc": "3.7.0.2",
+    "googletest": "1.18.0",
+    "mpicpp-lite": "2.7.1",
+    "boost": "1.90.0",
+    "hdf5": "1.14.6",
+    "vtk": "9.5.1",
+    "caliper": "2.15.0",
+    "petsc": "3.26.0",
+    "hypre": "3.0.0",
+    "superlu-dist": "9.2.1",
+    "metis": "5.1.0",
+    "parmetis": "4.0.3",
+    "scotch": "7.0.16",
+    "openblas": "0.3.34",
+    "intel-oneapi-mkl": "2026.1.0"
+  },
+  "compilers": [
+    {"family": "gcc", "version": "latest-3"},
+    {"family": "clang", "version": "latest-3", "gcc_toolchain": "latest"},
+    {"family": "oneapi", "version": "2026.1.1", "gcc_toolchain": "latest"}
+  ]
+}
