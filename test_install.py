@@ -313,6 +313,12 @@ class InstallerTests(unittest.TestCase):
                 self.assertIn("_is_unconditional_fortran(directive)", recipe)
                 self.assertNotIn("version(", recipe)
 
+    def test_llvm_amdgpu_overlay_drops_libquadmath(self):
+        recipe = (install.PROJECT / "spack/packages/llvm-amdgpu/package.py").read_text()
+        self.assertIn("class LlvmAmdgpu(BuiltinLlvmAmdgpu):", recipe)
+        self.assertIn('arg.startswith("-DFLANG_RUNTIME_F128_MATH_LIB")', recipe)
+        self.assertNotIn("version(", recipe)
+
     def test_superlu_dist_overlay_makes_fortran_optional(self):
         recipe = (install.PROJECT / "spack/packages/superlu-dist/package.py").read_text()
         self.assertIn("class SuperluDist(BuiltinSuperluDist):", recipe)

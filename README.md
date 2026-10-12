@@ -456,6 +456,9 @@ generated. To update it:
    - `scnlib` disables two benchmark targets.
    - `comgr` and `hipcc` drop a generated, unconditional `fortran` build
      dependency, so ROCm builds without a Fortran compiler.
+   - `llvm-amdgpu` leaves `FLANG_RUNTIME_F128_MATH_LIB` unset instead of
+     `libquadmath`, which only a GCC built with Fortran provides. AMD's Flang is
+     still built, without `REAL(16)` math through libquadmath; HIP does not use it.
 
    If upstream has fixed one of these, delete that overlay. The `petsc` and
    `superlu-dist` overlays also remove an inherited unconditional `fortran`
