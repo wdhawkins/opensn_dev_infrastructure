@@ -77,6 +77,30 @@ def compiler_releases(family, packages_ref=DEFAULT_PACKAGES_REF):
     return newest_majors(found)
 
 
+def recipe_url(package, packages_ref):
+    return ("https://raw.githubusercontent.com/spack/spack-packages/"
+            f"{packages_ref}/repos/spack_repo/builtin/packages/{package}/package.py")
+
+
+def newest_release(found, name):
+    releases = sorted(set(found), key=lambda x: tuple(map(int, x.split("."))), reverse=True)
+    if not releases:
+        raise ValueError(f"Found no {name} releases in the pinned recipe")
+    return releases[0]
+
+
+def gpu_release(kind, packages_ref=DEFAULT_PACKAGES_REF):
+    """Return the newest CUDA or ROCm release in the pinned recipes."""
+    if kind == "cuda":
+        # CUDA releases are keys of the recipe's table of per-platform installers.
+        recipe = read_url(recipe_url("cuda", packages_ref))
+        found = re.findall(r'^\s*"(\d+\.\d+\.\d+)":\s*\{', recipe, re.MULTILINE)
+    else:
+        recipe = read_url(recipe_url("hip", packages_ref))
+        found = re.findall(r'^\s*version\("(\d+\.\d+\.\d+)"', recipe, re.MULTILINE)
+    return newest_release(found, kind)
+
+
 def resolve_compilers(entries, packages_ref=DEFAULT_PACKAGES_REF):
     result = []
     for original in entries:
@@ -97,7 +121,7 @@ def resolve_compilers(entries, packages_ref=DEFAULT_PACKAGES_REF):
 
 def validate(config):
     allowed = {"root", "work", "jobs", "python", "mpich", "spack", "clang_ptx", "docs",
-               "prune", "compilers", "dependencies"}
+               "prune", "gpu", "compilers", "dependencies"}
     if set(config) - allowed:
         raise ValueError(f"Unknown configuration keys: {set(config) - allowed}")
     result = copy.deepcopy(config)
@@ -134,6 +158,12 @@ def validate(config):
             or not re.fullmatch(r"[\w./-]+", spack["ref"])
             or not re.fullmatch(r"[\w./-]+", spack["packages_ref"])):
         raise ValueError("spack requires an HTTPS URL and safe refs")
+    gpu = result.setdefault("gpu", {})
+    if not isinstance(gpu, dict) or set(gpu) - {"cuda", "rocm"}:
+        raise ValueError("gpu accepts only cuda and rocm")
+    for kind, value in gpu.items():
+        gpu[kind] = (gpu_release(kind, spack["packages_ref"]) if value == "latest"
+                     else version(value))
     compilers = resolve_compilers(result.get("compilers", []), spack["packages_ref"])
     if not compilers:
         raise ValueError("At least one compiler is required")
@@ -154,7 +184,7 @@ def validate(config):
     return result
 
 
-def manifest(specs, view, store, compiler_mixing=None):
+def manifest(specs, view, store, compiler_mixing=None, packages=None):
     lines = ["spack:", "  specs:"] + [f"  - {x}" for x in specs]
     lines += [f"  view: {view}", "  concretizer:", "    unify: true", "    reuse: false"]
     if compiler_mixing is not None:
@@ -163,6 +193,8 @@ def manifest(specs, view, store, compiler_mixing=None):
         else:
             value = str(compiler_mixing).lower()
         lines.append(f"    compiler_mixing: {value}")
+    if packages:
+        lines += ["  packages:"] + packages
     lines += ["  config:", "    install_tree:", f"      root: {store}"]
     return "\n".join(lines)
 
@@ -307,6 +339,10 @@ def modulefile(family, release, mpi, compiler_view, gcc_runtime_view, view, comm
         f"setenv MPICC {view}/bin/mpicc",
         f"setenv MPICXX {view}/bin/mpicxx",
         f"setenv PETSC_DIR {view}",
+        # AMD's clang++ compiles HIP code; use the stack's GCC C++ headers and libstdc++.
+        f"setenv HIPFLAGS --gcc-toolchain={gcc_runtime_view}",
+        # OpenSn's style requires clang-format 19; Clang compiler views shadow it on PATH.
+        f"setenv CLANG_FORMAT {common_venv}/bin/clang-format",
         f"setenv VIRTUAL_ENV {stack_venv}",
         f"setenv Python3_EXECUTABLE {stack_venv}/bin/python",
         f"setenv pybind11_DIR {common_venv}/{py_site}/pybind11/share/cmake/pybind11",
@@ -336,6 +372,62 @@ def tool_modulefile(name, release, view):
         f"prepend-path PATH {view}/bin",
         f"prepend-path CMAKE_PREFIX_PATH {view}",
     ])
+
+
+def gpu_modulefile(kind, release, view):
+    if kind == "cuda":
+        return "\n".join([
+            "#%Module1.0",
+            f'module-whatis "CUDA toolkit {release}"',
+            "conflict cuda",
+            f"setenv CUDA_HOME {view}",
+            f"setenv CUDA_PATH {view}",
+            f"setenv CUDAToolkit_ROOT {view}",
+            f"prepend-path PATH {view}/bin",
+            f"prepend-path CMAKE_PREFIX_PATH {view}",
+            f"prepend-path LD_LIBRARY_PATH {view}/lib64",
+        ])
+    return "\n".join([
+        "#%Module1.0",
+        f'module-whatis "ROCm HIP toolkit {release}"',
+        "conflict rocm",
+        f"setenv ROCM_PATH {view}",
+        f"setenv HIP_PATH {view}",
+        "setenv HIP_PLATFORM amd",
+        f"setenv HIPCXX {view}/bin/clang++",
+        f"prepend-path PATH {view}/bin",
+        f"prepend-path CMAKE_PREFIX_PATH {view}",
+        f"prepend-path LD_LIBRARY_PATH {view}/lib",
+    ])
+
+
+def gpu_lines(kind, release, root, envs, store, jobs):
+    """Install CUDA or ROCm in its own environment, independent of every compiler stack."""
+    env = envs / f"{kind}-{release}"
+    view = root / "gpu" / kind / release / "view"
+    if kind == "cuda":
+        # NVIDIA publishes CUDA installers for x86_64 and aarch64 Linux.
+        arches, specs, packages, check = ("x86_64|aarch64", [f"cuda@{release}"], None,
+                                          view / "bin/nvcc")
+    else:
+        # Mesa is only an OpenGL provider for HIP; do not build its LLVM rasterizer.
+        arches, specs, packages, check = ("x86_64", [f"hip@{release}"],
+                                          ["    mesa:", '      require: "~llvm"'],
+                                          view / "bin/hipcc")
+    lines = [f'case "$(uname -m)" in {arches})']
+    add_file(lines, env / "spack.yaml", manifest(specs, view, store, packages=packages))
+    lines += [f"echo '==> Concretizing {kind} {release}'",
+              f'"$spack" -e {quote(env)} concretize -f',
+              f"echo '==> Installing {kind} {release}'",
+              f'"$spack" -e {quote(env)} install -j {jobs}',
+              f'"$spack" -e {quote(env)} env view regenerate',
+              f"{quote(check)} --version >/dev/null"]
+    add_file(lines, root / "modules" / kind / release, gpu_modulefile(kind, release, view))
+    return lines + [
+        ";;",
+        f"*) echo '==> Skipping {kind} {release}: not available for '\"$(uname -m)\" ;;",
+        "esac",
+    ]
 
 
 def add_file(lines, path, content):
@@ -458,6 +550,8 @@ def generate(config):
                   f"{quote(tool_view / 'bin' / name)} --version >/dev/null"]
         add_file(lines, root / "modules" / name / release,
                  tool_modulefile(name, release, tool_view))
+    for kind, release in config["gpu"].items():
+        lines += gpu_lines(kind, release, root, envs, store, config["jobs"])
     py_site = "lib/python" + ".".join(config["python"].split(".")[:2]) + "/site-packages"
     stacks, compilers = [], []
     for item in config["compilers"]:

@@ -65,12 +65,16 @@ views and modules hide that store from users:
 /opt/local/python/python-P.Y.Z/            shared Python/CMake/GNU Make view
 /opt/local/python/common-P.Y.Z/            shared pip environment
 /opt/local/tools/TOOL/X.Y.Z/view/          shared Doxygen or Pandoc view
+/opt/local/gpu/cuda/X.Y.Z/view/            optional CUDA toolkit view
+/opt/local/gpu/rocm/X.Y.Z/view/            optional ROCm/HIP toolkit view
 /opt/local/compilers/FAMILY/X.Y.Z/view/    compiler view
 /opt/local/opensn/FAMILY/FAMILY-X.Y.Z/
     mpich-M.Y.Z/view/                      MPI and OpenSn dependencies
     mpich-M.Y.Z/venv/                      stack-specific mpi4py environment
 /opt/local/modules/FAMILY/X.Y.Z            public modulefile
 /opt/local/modules/TOOL/X.Y.Z              public tool modulefile
+/opt/local/modules/cuda/X.Y.Z              public CUDA modulefile
+/opt/local/modules/rocm/X.Y.Z              public ROCm modulefile
 ```
 
 Each compiler and its dependency stack are separate Spack spec groups in one
@@ -128,6 +132,52 @@ Doxygen and Pandoc are installed once in independent Spack environments. Their
 modulefiles do not select a compiler or MPI stack, so the tools can be loaded
 with any OpenSn development stack and upgraded independently.
 
+## GPU toolkits
+
+The optional `gpu` object installs the CUDA toolkit, the ROCm HIP toolkit, or
+both, each in its own Spack environment like Doxygen and Pandoc. They belong to
+no compiler stack:
+
+```json
+"gpu": {"cuda": "latest", "rocm": "latest"}
+```
+
+Each value is an exact release or `latest`, which `install.py` resolves to the
+newest release in the recipes at `spack.packages_ref` when it generates the
+script (CUDA 13.4.1 and ROCm 10.0.0 at the default commit). Omit a key, or the
+whole object, to skip that toolkit. Spack installs NVIDIA's CUDA binary
+installer, so CUDA needs no compiler and is installed on x86_64 and aarch64.
+ROCm is built from source, which takes several hours because it includes AMD's
+LLVM; like the Doxygen and Pandoc environments, its environment names no
+compiler, so Spack chooses one of the available GCCs. It is installed only on
+x86_64. The script
+skips a toolkit on other architectures. Old releases are not pruned.
+
+The CUDA module sets `CUDA_HOME`, `CUDA_PATH`, and `CUDAToolkit_ROOT`. The ROCm
+module sets `ROCM_PATH`, `HIP_PATH`, `HIP_PLATFORM=amd`, and `HIPCXX` (AMD's
+`clang++`). Both add the toolkit to `PATH`, `CMAKE_PREFIX_PATH`, and
+`LD_LIBRARY_PATH`. Load one together with a stack module:
+
+```sh
+module load gcc/16.2.0 cuda/13.4.1
+cmake -S . -B build-cuda -DOPENSN_WITH_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" -DOPENSN_WITH_PYTHON_MODULE=ON
+```
+
+OpenSn passes the stack's C++ compiler to `nvcc` as its host compiler, and
+each CUDA release supports only host compilers up to a certain version. Spack's
+records show CUDA 13.4 supports GCC up to 16 and Clang up to 22, so `nvcc`
+rejects the Clang 23 stack. Use a supported stack with CUDA, or add
+`-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler` at your own risk.
+
+HIP code is compiled by AMD's `clang++`, which would otherwise use the system
+GCC's C++ headers and `libstdc++`, while the rest of OpenSn uses the stack's.
+Each stack module therefore sets `HIPFLAGS=--gcc-toolchain=GCC_VIEW`, naming the
+same GCC whose `libstdc++` the module preloads: the stack's own GCC, or the
+`gcc_toolchain` of a Clang or oneAPI stack. CMake reads `HIPFLAGS` only when it
+first configures a build directory, so load the modules before configuring, and
+reconfigure an existing HIP build directory from scratch.
+
 The public module preloads the selected GCC toolchain's ``libstdc++``. Binary
 Python packages in the shared environment can contain an RPATH to the older
 compiler runtime used to build their wheels. Without the preload, importing one
@@ -169,6 +219,11 @@ cmake --build build-gcc -j4
 build-gcc/test/opensn-unit
 test/run_tests -d test/python --exe "$PWD/build-gcc/python/opensn" -j4 -v1 -w3
 ```
+
+Every stack module sets `CLANG_FORMAT` to the clang-format 19.1.7 that pip
+installs in the shared environment, the version OpenSn's style requires. Use
+`"$CLANG_FORMAT"` rather than `clang-format`: in a Clang module, the compiler's
+own, newer `clang-format` comes first on `PATH`.
 
 Use a separate OpenSn build directory for every module. The module selects the
 stack virtual environment and its matching `mpi4py`; users never run Spack or

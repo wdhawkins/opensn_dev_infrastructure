@@ -12,6 +12,7 @@
   "clang_ptx": true,
   "docs": true,
   "prune": false,
+  "gpu": {"cuda": "latest", "rocm": "latest"},
   "dependencies": {
     "cmake": "3.31.12",
     "gmake": "4.4.1",

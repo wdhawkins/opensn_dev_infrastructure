@@ -194,6 +194,10 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("/opt/local/compilers/", module)
             self.assertIn("/opt/local/python/python-3.13.13/bin", module)
             self.assertIn("prepend-path LD_PRELOAD", module)
+            self.assertIn("setenv HIPFLAGS --gcc-toolchain=/opt/local/compilers/gcc/16.2.0/view",
+                          module)
+            self.assertIn("setenv CLANG_FORMAT /opt/local/python/common-3.13.13/bin/clang-format",
+                          module)
             self.assertIn("/lib64/libstdc++.so.6", module)
         doxygen = next(module for module in modules if "documentation tool doxygen" in module)
         self.assertIn("setenv DOXYGEN_ROOT /opt/local/tools/doxygen/1.17.0/view", doxygen)
@@ -204,6 +208,40 @@ class InstallerTests(unittest.TestCase):
         oneapi = next(module for module in stack_modules if "OpenSn oneapi" in module)
         self.assertIn("/compiler/latest/bin/icx", oneapi)
         self.assertIn("/compiler/latest/bin/icpx", oneapi)
+
+    def test_gpu_toolkits_are_independent_environments(self):
+        script = install.generate(install.validate(copy.deepcopy(CONFIG)))
+        self.assertNotIn("cuda@", script)
+        self.assertNotIn("hip@", script)
+        config = dict(copy.deepcopy(CONFIG), gpu={"cuda": "latest", "rocm": "10.0.0"})
+        with patch.object(install, "gpu_release", return_value="13.4.1") as latest:
+            resolved = install.validate(config)
+        latest.assert_called_once_with("cuda", install.DEFAULT_PACKAGES_REF)
+        self.assertEqual(resolved["gpu"], {"cuda": "13.4.1", "rocm": "10.0.0"})
+        script = install.generate(resolved)
+        self.assertIn("  - cuda@13.4.1\n  view: /opt/local/gpu/cuda/13.4.1/view", script)
+        self.assertIn("  - hip@10.0.0\n  view: /opt/local/gpu/rocm/10.0.0/view", script)
+        self.assertIn('case "$(uname -m)" in x86_64|aarch64)', script)
+        self.assertIn('case "$(uname -m)" in x86_64)', script)
+        self.assertIn("setenv CUDAToolkit_ROOT /opt/local/gpu/cuda/13.4.1/view", script)
+        self.assertIn("setenv HIPCXX /opt/local/gpu/rocm/10.0.0/view/bin/clang++", script)
+        for module in ("/opt/local/modules/cuda/13.4.1", "/opt/local/modules/rocm/10.0.0"):
+            self.assertLess(script.index("--version >/dev/null"), script.index(module))
+        env = script.index("environments/cuda-13.4.1/spack.yaml")
+        self.assertNotIn("%", script[env:script.index("OPENSN_EOF", env)])
+        self.assertLess(script.index("Installing rocm 10.0.0"),
+                        script.index("Concretizing gcc 16.2.0"))
+        for bad in ({"cuda": "13"}, {"opencl": "latest"}, ["cuda"]):
+            with self.subTest(gpu=bad), self.assertRaises(ValueError):
+                install.validate(dict(copy.deepcopy(CONFIG), gpu=bad))
+
+    def test_gpu_release_reads_pinned_recipes(self):
+        cuda = '    "13.4.1": {\n    "13.3.1": {\n    "12.9.1": {\n'
+        hip = '    version("10.0.0", sha256="a")\n    version("7.14.0", sha256="b")\n'
+        with patch.object(install, "read_url", return_value=cuda):
+            self.assertEqual(install.gpu_release("cuda"), "13.4.1")
+        with patch.object(install, "read_url", return_value=hip):
+            self.assertEqual(install.gpu_release("rocm"), "10.0.0")
 
     def test_prune_is_opt_in(self):
         script = install.generate(install.validate(copy.deepcopy(CONFIG)))

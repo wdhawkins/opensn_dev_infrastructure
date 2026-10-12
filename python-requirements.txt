@@ -1,5 +1,8 @@
-# Shared Python packages used to build OpenSn and run its tests and tutorials.
+# Shared Python packages used to build, lint, and test OpenSn (including coverage) and run its tutorials.
 pybind11
 numpy
 matplotlib
 h5py
+flake8
+gcovr
+clang-format==19.1.7
