@@ -11,6 +11,7 @@
   },
   "clang_ptx": true,
   "docs": true,
+  "prune": false,
   "dependencies": {
     "cmake": "3.31.12",
     "gmake": "4.4.1",

@@ -97,7 +97,7 @@ def resolve_compilers(entries, packages_ref=DEFAULT_PACKAGES_REF):
 
 def validate(config):
     allowed = {"root", "work", "jobs", "python", "mpich", "spack", "clang_ptx", "docs",
-               "compilers", "dependencies"}
+               "prune", "compilers", "dependencies"}
     if set(config) - allowed:
         raise ValueError(f"Unknown configuration keys: {set(config) - allowed}")
     result = copy.deepcopy(config)
@@ -122,6 +122,8 @@ def validate(config):
         raise ValueError("clang_ptx must be a JSON boolean")
     if type(result.setdefault("docs", True)) is not bool:
         raise ValueError("docs must be a JSON boolean")
+    if type(result.setdefault("prune", False)) is not bool:
+        raise ValueError("prune must be a JSON boolean")
     spack = result.setdefault("spack", {})
     if set(spack) - {"url", "ref", "packages_ref"}:
         raise ValueError("spack accepts only url, ref, and packages_ref")
@@ -341,6 +343,41 @@ def add_file(lines, path, content):
               content, "OPENSN_EOF"]
 
 
+def prune_lines(root, envs, stacks, compilers):
+    """Remove stack environments, views, and modules that are no longer configured.
+
+    ``stacks`` holds the configured environment names and ``compilers`` the configured
+    FAMILY/RELEASE pairs. Every remaining environment directory protects its packages
+    (including build dependencies) from garbage collection.
+    """
+    opensn, compiler_root, modules = root / "opensn", root / "compilers", root / "modules"
+    return [
+        "echo '==> Pruning stacks that are no longer configured'",
+        "keep_stacks=" + quote(" " + " ".join(stacks) + " "),
+        "keep_compilers=" + quote(" " + " ".join(compilers) + " "),
+        f"for env_dir in {quote(envs)}/*-mpich-*/; do",
+        '  [[ -d $env_dir ]] || continue',
+        '  name=$(basename "$env_dir")',
+        '  [[ $keep_stacks == *" $name "* ]] && continue',
+        '  if [[ ! $name =~ ^(gcc|clang|oneapi)-([0-9.]+)-mpich-([0-9.]+)$ ]]; then',
+        '    echo "Skipping unrecognized environment $name" >&2',
+        "    continue",
+        "  fi",
+        '  family=${BASH_REMATCH[1]} release=${BASH_REMATCH[2]} mpi=${BASH_REMATCH[3]}',
+        '  echo "==> Removing stack $name"',
+        f'  rm -rf -- "$env_dir" {quote(opensn)}/"$family/$family-$release/mpich-$mpi"',
+        f'  rmdir {quote(opensn)}/"$family/$family-$release" 2>/dev/null || true',
+        '  if [[ $keep_compilers != *" $family/$release "* ]]; then',
+        f'    rm -rf -- {quote(compiler_root)}/"$family/$release" '
+        f'{quote(modules)}/"$family/$release"',
+        "  fi",
+        "done",
+        "keep_envs=()",
+        f'for env_dir in {quote(envs)}/*/; do keep_envs+=(-e "$env_dir"); done',
+        '"$spack" gc -y -b "${keep_envs[@]}"',
+    ]
+
+
 def generate(config):
     root = Path(config["root"])
     private = root / ".spack"
@@ -422,8 +459,11 @@ def generate(config):
         add_file(lines, root / "modules" / name / release,
                  tool_modulefile(name, release, tool_view))
     py_site = "lib/python" + ".".join(config["python"].split(".")[:2]) + "/site-packages"
+    stacks, compilers = [], []
     for item in config["compilers"]:
         family, release, mpi = item["family"], item["version"], item["mpich"]
+        stacks.append(f"{family}-{release}-mpich-{mpi}")
+        compilers.append(f"{family}/{release}")
         prefix = root / "opensn" / family / f"{family}-{release}" / f"mpich-{mpi}"
         view = prefix / "view"
         stack_venv = prefix / "venv"
@@ -513,6 +553,8 @@ def generate(config):
                  modulefile(family, release, mpi, compiler_view,
                             compiler_view if family == "gcc" else bootstrap_view, view, python_view,
                             common_venv, stack_venv, config["python"]))
+    if config["prune"]:
+        lines += prune_lines(root, envs, stacks, compilers)
     return "\n".join(lines) + "\n"
 
 

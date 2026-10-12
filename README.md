@@ -240,8 +240,124 @@ configuration and regenerate the script rather than editing a `spack.yaml`.
 To change a project default rather than only your own configuration, update the
 value in both `DEPENDENCIES` in `install.py` and `example.json`, then run the
 tests. A version that the pinned recipe does not know about requires either a
-newer `spack.packages_ref` (below) or a `version(...)` entry in a subclass under
-`spack/packages`, following the existing overlays.
+newer `spack.packages_ref` (below) or a new `version(...)` entry, described
+next.
+
+### Adding a new version to a recipe
+
+The installer adds this checkout's `spack` directory to Spack as the
+`opensn_toolchains` repository, which takes precedence over the builtin one.
+Spack reads its recipes from this checkout on every command, so recipe edits
+apply immediately, and the generated script must be run with the checkout at
+the same path. Run the commands below with the private Spack described above.
+
+**A package with its own recipe here**, such as `mpicpp-lite`:
+
+1. Generate the version line. `spack checksum` derives the release URL from the
+   recipe's `url`, downloads the tarball, and prints a checksummed directive:
+
+   ```sh
+   "$spack" checksum mpicpp-lite 2.8.0
+   ```
+
+   Add the printed line to `spack/packages/mpicpp-lite/package.py` above the
+   existing versions:
+
+   ```python
+   version("2.8.0", sha256="...")
+   version("2.7.1", tag="v2.7.1")
+   ```
+
+   Keep the older versions, so that existing environments still concretize.
+   Change dependencies or build options with a `when="@2.8.0:"` condition if the
+   new release needs them.
+2. Confirm that Spack sees it:
+
+   ```sh
+   "$spack" versions mpicpp-lite
+   "$spack" info mpicpp-lite
+   ```
+
+3. Set `"mpicpp-lite": "2.8.0"` in your configuration, regenerate the script,
+   and run it. The new version has a new hash, so Spack builds it and
+   everything that depends on it; `mpicpp-lite` is a stack root that nothing
+   else depends on, so only it is rebuilt.
+
+**A builtin package**, such as `petsc` or `hypre`, gets a version from a newer
+`spack.packages_ref` when upstream has added it, which is the preferred route.
+Otherwise, add the version in an overlay:
+
+1. Run `"$spack" checksum NAME X.Y.Z` as above.
+2. If `spack/packages/NAME/package.py` already exists, add the printed
+   `version(...)` line to its class. Otherwise create a subclass that inherits
+   everything else from the pinned recipe:
+
+   ```python
+   # Copyright Spack Project Developers. See COPYRIGHT file for details.
+   #
+   # SPDX-License-Identifier: (Apache-2.0 OR MIT)
+
+   from spack_repo.builtin.packages.hypre.package import Hypre as BuiltinHypre
+
+   from spack.package import *
+
+
+   class Hypre(BuiltinHypre):
+       """Add a release that the pinned builtin recipe does not include."""
+
+       version("3.1.0", sha256="...")
+   ```
+
+   The directory uses the package name with hyphens (`spack/packages/superlu-dist`),
+   while the import path uses the builtin directory name with underscores
+   (`spack_repo.builtin.packages.superlu_dist.package`). The class name is the
+   one in the builtin recipe (`SuperluDist`).
+3. Set the version in your configuration, regenerate, and run the script.
+
+The tests for the `petsc` and `superlu-dist` overlays assert that they contain
+no `version(` lines, to keep those overlays minimal. Adding a version to either
+overlay requires relaxing those assertions in `test_install.py`. Remove the
+added version once a newer `spack.packages_ref` provides it.
+
+To make a new version the project default, also update `DEPENDENCIES` in
+`install.py`, `example.json`, and any test that names the old version (for
+example `mpicpp-lite@2.7.1` in `test_install.py`), then run the tests.
+
+### Choosing the GCC toolchain for Clang and oneAPI
+
+Each Clang or oneAPI entry in `compilers` names a `gcc_toolchain`. The value
+`latest` selects the newest GCC in the same configuration after `latest-3` is
+expanded; an explicit version must match a configured GCC stack, and
+`install.py` rejects any other value. That GCC builds LLVM or installs the
+oneAPI compilers, is registered in the stack manifest as an external compiler
+from `root/compilers/gcc/X.Y.Z/view`, and supplies the `libstdc++` that the
+module preloads. Clang and oneAPI environment names do not include the GCC
+version, so when `latest` moves to a newer GCC, the next run rebuilds those
+stacks in place against it.
+
+### Removing stacks that are no longer configured
+
+The installer never removes anything by default. When a stack leaves the
+configuration, for example because a newer `spack.packages_ref` moves a
+`latest-3` entry to a newer release, its environment, views, virtual
+environment, and module remain usable. Set `"prune": true` to remove them.
+After every configured stack installs successfully, the script then:
+
+1. removes each `FAMILY-X.Y.Z-mpich-M.Y.Z` environment that is not configured,
+   together with its `opensn/FAMILY/FAMILY-X.Y.Z/mpich-M.Y.Z` view and virtual
+   environment;
+2. removes the compiler view and module of each removed stack whose compiler
+   is no longer configured at all (a stack that only changed MPICH versions
+   keeps them); and
+3. runs `spack gc -b`, keeping every package, including build dependencies,
+   that any remaining environment under `root/.spack/environments` needs.
+
+A GCC in use as a `gcc_toolchain` is always a configured stack, so pruning never
+removes it. The Python and tool environments are not pruned. To remove a stack
+by hand, delete the same directories, then run `"$spack" gc -b` with
+`-e ENV_DIR` for every remaining environment directory. Do not use `gc -E`:
+it protects only Spack's named environments, not this installer's directory
+environments, so it would also delete the stacks you keep.
 
 ### Changing the Spack version
 

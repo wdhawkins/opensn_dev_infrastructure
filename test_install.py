@@ -205,6 +205,58 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("/compiler/latest/bin/icx", oneapi)
         self.assertIn("/compiler/latest/bin/icpx", oneapi)
 
+    def test_prune_is_opt_in(self):
+        script = install.generate(install.validate(copy.deepcopy(CONFIG)))
+        self.assertNotIn("gc -y", script)
+        script = install.generate(install.validate(dict(copy.deepcopy(CONFIG), prune=True)))
+        self.assertIn("keep_stacks=' gcc-16.2.0-mpich-5.0.2 clang-23.1.2-mpich-5.0.2 "
+                      "oneapi-2026.1.1-mpich-5.0.2 '", script)
+        self.assertLess(script.rindex("install -j"), script.index("Pruning stacks"))
+        with self.assertRaises(ValueError):
+            install.validate(dict(copy.deepcopy(CONFIG), prune="yes"))
+
+    def test_prune_removes_only_unconfigured_stacks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            envs = root / ".spack/environments"
+            paths = {
+                "env_keep": envs / "gcc-16.2.0-mpich-5.0.2",
+                "env_old_mpich": envs / "gcc-16.2.0-mpich-4.3.0",
+                "env_old_gcc": envs / "gcc-13.4.0-mpich-5.0.2",
+                "env_python": envs / "python-3.13.13",
+                "env_unknown": envs / "custom-mpich-x",
+                "stack_keep": root / "opensn/gcc/gcc-16.2.0/mpich-5.0.2",
+                "stack_old_mpich": root / "opensn/gcc/gcc-16.2.0/mpich-4.3.0",
+                "stack_old_gcc": root / "opensn/gcc/gcc-13.4.0/mpich-5.0.2",
+                "compiler_keep": root / "compilers/gcc/16.2.0/view",
+                "compiler_old": root / "compilers/gcc/13.4.0/view",
+            }
+            for path in paths.values():
+                path.mkdir(parents=True)
+            for name in ("16.2.0", "13.4.0"):
+                (root / "modules/gcc").mkdir(parents=True, exist_ok=True)
+                (root / "modules/gcc" / name).write_text("#%Module1.0\n")
+            log = root / "spack.log"
+            stub = root / "spack"
+            stub.write_text(f'#!/bin/sh\necho "$@" > {log}\n')
+            stub.chmod(0o755)
+            lines = install.prune_lines(root, envs, ["gcc-16.2.0-mpich-5.0.2"], ["gcc/16.2.0"])
+            script = "set -euo pipefail\n" + f"spack={stub}\n" + "\n".join(lines) + "\n"
+            subprocess.run(["bash"], input=script, text=True, check=True, capture_output=True)
+            for key in ("env_keep", "env_python", "env_unknown", "stack_keep", "compiler_keep"):
+                self.assertTrue(paths[key].exists(), key)
+            for key in ("env_old_mpich", "env_old_gcc", "stack_old_mpich", "stack_old_gcc",
+                        "compiler_old"):
+                self.assertFalse(paths[key].exists(), key)
+            self.assertFalse((root / "opensn/gcc/gcc-13.4.0").exists())
+            self.assertTrue((root / "modules/gcc/16.2.0").exists())
+            self.assertFalse((root / "modules/gcc/13.4.0").exists())
+            gc = log.read_text().split()
+            self.assertEqual(gc[:3], ["gc", "-y", "-b"])
+            kept = {Path(x).name for x in gc[3:] if x != "-e"}
+            self.assertEqual(kept, {"gcc-16.2.0-mpich-5.0.2", "python-3.13.13",
+                                    "custom-mpich-x"})
+
     def test_selected_petsc_version(self):
         self.assertEqual(install.DEPENDENCIES["petsc"], "3.26.0")
 
