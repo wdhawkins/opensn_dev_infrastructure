@@ -305,6 +305,14 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('depends_on("fortran", type="build", when="+fortran")', recipe)
         self.assertNotIn("version(", recipe)
 
+    def test_rocm_overlays_drop_generated_fortran_dependency(self):
+        for name, cls in (("comgr", "Comgr"), ("hipcc", "Hipcc")):
+            with self.subTest(package=name):
+                recipe = (install.PROJECT / f"spack/packages/{name}/package.py").read_text()
+                self.assertIn(f"class {cls}(Builtin{cls}):", recipe)
+                self.assertIn("_is_unconditional_fortran(directive)", recipe)
+                self.assertNotIn("version(", recipe)
+
     def test_superlu_dist_overlay_makes_fortran_optional(self):
         recipe = (install.PROJECT / "spack/packages/superlu-dist/package.py").read_text()
         self.assertIn("class SuperluDist(BuiltinSuperluDist):", recipe)

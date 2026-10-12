@@ -454,10 +454,13 @@ generated. To update it:
    - `petsc` makes `superlu-dist` available without `+fortran`.
    - `superlu-dist` makes its Fortran interface optional.
    - `scnlib` disables two benchmark targets.
+   - `comgr` and `hipcc` drop a generated, unconditional `fortran` build
+     dependency, so ROCm builds without a Fortran compiler.
 
    If upstream has fixed one of these, delete that overlay. The `petsc` and
    `superlu-dist` overlays also remove an inherited unconditional `fortran`
-   build dependency through Spack internals; if those internals change, Spack
+   build dependency through Spack internals, as do `comgr` and `hipcc`; if
+   those internals change, Spack
    reports a `TypeError` from the overlay when it loads the recipe.
    `"$spack" info petsc` and `"$spack" info superlu-dist` load both overlays.
 4. Set the new hash in your configuration (and in `DEFAULT_PACKAGES_REF` and
