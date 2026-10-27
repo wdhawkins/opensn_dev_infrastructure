@@ -93,7 +93,11 @@ with only C and C++, LLVM is built without Flang, and the modules set no `FC`,
 `F77`, or `MPIFC`. The oneAPI compiler package always installs ifx, but no stack
 package uses it. The oneAPI module uses Intel's installed ``compiler/latest/bin`` entry
 point, while GCC and LLVM expose their drivers directly in the view's ``bin``
-directory. Clang and oneAPI environments contain an additional bootstrap group for
+directory. Intel's binaries, including `sycl-ls` and programs built with `icx`
+or `icpx`, have no RPATH to the compiler runtime, so the oneAPI module also sets
+what Intel's `compiler/latest/env/vars.sh` sets for it: `CMPLR_ROOT`, the
+runtime directories on `LD_LIBRARY_PATH` and `LIBRARY_PATH`, and
+`OCL_ICD_FILENAMES` for the SYCL CPU device. Clang and oneAPI environments contain an additional bootstrap group for
 their selected GCC toolchain. The already installed GCC view is registered in
 those manifests as an external compiler with explicit C and C++ paths. This gives Spack an eligible compiler for building LLVM or the oneAPI
 compiler while keeping unrestricted cross-stack reuse disabled; compiler

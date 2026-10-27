@@ -208,6 +208,13 @@ class InstallerTests(unittest.TestCase):
         oneapi = next(module for module in stack_modules if "OpenSn oneapi" in module)
         self.assertIn("/compiler/latest/bin/icx", oneapi)
         self.assertIn("/compiler/latest/bin/icpx", oneapi)
+        root = "/opt/local/compilers/oneapi/2026.1.1/view/compiler/latest"
+        self.assertIn(f"setenv CMPLR_ROOT {root}", oneapi)
+        self.assertIn(f"prepend-path LD_LIBRARY_PATH {root}/lib", oneapi)
+        self.assertIn(f"prepend-path OCL_ICD_FILENAMES {root}/lib/libintelocl.so", oneapi)
+        for module in stack_modules:
+            if module is not oneapi:
+                self.assertNotIn("CMPLR_ROOT", module)
 
     def test_gpu_toolkits_are_independent_environments(self):
         script = install.generate(install.validate(copy.deepcopy(CONFIG)))

@@ -328,6 +328,18 @@ def modulefile(family, release, mpi, compiler_view, gcc_runtime_view, view, comm
                     if family == "oneapi" else compiler_view / "bin")
     py = ".".join(python.split(".")[:2])
     py_site = f"lib/python{py}/site-packages"
+    oneapi = []
+    if family == "oneapi":
+        # Intel's binaries (sycl-ls, and programs built with icx/icpx) have no RPATH to the
+        # compiler runtime; replicate what compiler/latest/env/vars.sh sets.
+        root = compiler_view / "compiler" / "latest"
+        oneapi = [
+            f"setenv CMPLR_ROOT {root}",
+            f"prepend-path LD_LIBRARY_PATH {root}/opt/compiler/lib",
+            f"prepend-path LD_LIBRARY_PATH {root}/lib",
+            f"prepend-path LIBRARY_PATH {root}/lib",
+            f"prepend-path OCL_ICD_FILENAMES {root}/lib/libintelocl.so",
+        ]
     return "\n".join([
         "#%Module1.0",
         f'module-whatis "OpenSn {family} {release} / MPICH {mpi}"',
@@ -359,6 +371,7 @@ def modulefile(family, release, mpi, compiler_view, gcc_runtime_view, view, comm
         f"prepend-path LD_LIBRARY_PATH {view}/lib64",
         f"prepend-path LD_LIBRARY_PATH {compiler_view}/lib",
         f"prepend-path LD_LIBRARY_PATH {compiler_view}/lib64",
+        *oneapi,
         f"prepend-path LD_PRELOAD {gcc_runtime_view}/lib64/libstdc++.so.6",
     ])
 
