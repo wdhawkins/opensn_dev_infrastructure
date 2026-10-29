@@ -12,7 +12,7 @@
   "clang_ptx": true,
   "docs": true,
   "prune": false,
-  "gpu": {"cuda": "latest", "rocm": "latest"},
+  "gpu": {"cuda": "latest", "rocm": "latest", "hip_nvidia": "latest"},
   "dependencies": {
     "cmake": "3.31.12",
     "gmake": "4.4.1",
@@ -36,6 +36,8 @@
   "compilers": [
     {"family": "gcc", "version": "latest-3"},
     {"family": "clang", "version": "latest-3", "gcc_toolchain": "latest"},
-    {"family": "oneapi", "version": "2026.1.1", "gcc_toolchain": "latest"}
+    {"family": "oneapi", "version": "2026.1.1", "gcc_toolchain": "latest"},
+    {"family": "gcc", "version": "latest", "cuda_arch": "89",
+     "dependencies": {"hypre": "3.2.0"}}
   ]
 }

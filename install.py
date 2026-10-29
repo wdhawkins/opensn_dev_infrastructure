@@ -13,9 +13,12 @@ import subprocess
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parent
+# Installed in this order: HIP on NVIDIA builds against the installed CUDA.
+GPU_KINDS = ("cuda", "rocm", "hip_nvidia")
+STACK_FAMILIES = ("gcc", "gcc-cuda", "clang", "oneapi")
 DEFAULT_PACKAGES_REF = "19c15b598f462517e2d091baa65a86a53c7d36a9"
 DEPENDENCIES = {
-    "cmake": "4.4.4",
+    "cmake": "3.31.12",
     "gmake": "4.4.1",
     "doxygen": "1.17.0",
     "pandoc": "3.7.0.2",
@@ -90,7 +93,7 @@ def newest_release(found, name):
 
 
 def gpu_release(kind, packages_ref=DEFAULT_PACKAGES_REF):
-    """Return the newest CUDA or ROCm release in the pinned recipes."""
+    """Return the newest CUDA or HIP (ROCm) release in the pinned recipes."""
     if kind == "cuda":
         # CUDA releases are keys of the recipe's table of per-platform installers.
         recipe = read_url(recipe_url("cuda", packages_ref))
@@ -110,12 +113,16 @@ def resolve_compilers(entries, packages_ref=DEFAULT_PACKAGES_REF):
             result += [dict(item, version=x) for x in releases]
         else:
             result.append(item)
-    gccs = [x["version"] for x in result if x.get("family") == "gcc"]
+    gccs = [x["version"] for x in result
+            if x.get("family") == "gcc" and "cuda_arch" not in x and x.get("version") != "latest"]
     for item in result:
-        if item.get("gcc_toolchain") == "latest":
-            if not gccs:
-                raise ValueError("gcc_toolchain: latest requires a GCC stack")
-            item["gcc_toolchain"] = max(gccs, key=lambda x: tuple(map(int, x.split("."))))
+        for key in ("gcc_toolchain", "version"):
+            if key == "version" and "cuda_arch" not in item:
+                continue
+            if item.get(key) == "latest":
+                if not gccs:
+                    raise ValueError(f"{key}: latest requires a GCC stack")
+                item[key] = max(gccs, key=lambda x: tuple(map(int, x.split("."))))
     return result
 
 
@@ -159,28 +166,54 @@ def validate(config):
             or not re.fullmatch(r"[\w./-]+", spack["packages_ref"])):
         raise ValueError("spack requires an HTTPS URL and safe refs")
     gpu = result.setdefault("gpu", {})
-    if not isinstance(gpu, dict) or set(gpu) - {"cuda", "rocm"}:
-        raise ValueError("gpu accepts only cuda and rocm")
+    if not isinstance(gpu, dict) or set(gpu) - set(GPU_KINDS):
+        raise ValueError("gpu accepts only " + ", ".join(GPU_KINDS))
+    if "hip_nvidia" in gpu and "cuda" not in gpu:
+        raise ValueError("gpu.hip_nvidia requires gpu.cuda")
     for kind, value in gpu.items():
-        gpu[kind] = (gpu_release(kind, spack["packages_ref"]) if value == "latest"
+        recipe = "cuda" if kind == "cuda" else "rocm"
+        gpu[kind] = (gpu_release(recipe, spack["packages_ref"]) if value == "latest"
                      else version(value))
     compilers = resolve_compilers(result.get("compilers", []), spack["packages_ref"])
     if not compilers:
         raise ValueError("At least one compiler is required")
-    known_gcc = {x.get("version") for x in compilers if x.get("family") == "gcc"}
+    known_gcc = {x.get("version") for x in compilers
+                 if x.get("family") == "gcc" and "cuda_arch" not in x}
     seen = set()
     for item in compilers:
-        if set(item) - {"family", "version", "mpich", "gcc_toolchain"}:
+        if set(item) - {"family", "version", "mpich", "gcc_toolchain", "cuda_arch",
+                        "dependencies"}:
             raise ValueError("Unknown compiler configuration key")
         family, release = item.get("family"), version(item.get("version"))
-        if family not in ("gcc", "clang", "oneapi") or (family, release) in seen:
+        cuda = "cuda_arch" in item
+        if family not in ("gcc", "clang", "oneapi") or (family, release, cuda) in seen:
             raise ValueError(f"Invalid or duplicate compiler: {family}/{release}")
-        seen.add((family, release))
+        seen.add((family, release, cuda))
         item["mpich"] = version(item.get("mpich", result["mpich"]))
         if family != "gcc" and item.get("gcc_toolchain") not in known_gcc:
             raise ValueError(f"{family}/{release} requires a listed gcc_toolchain")
-    result["compilers"] = ([item for item in compilers if item["family"] == "gcc"]
-                           + [item for item in compilers if item["family"] != "gcc"])
+        if cuda:
+            # The CUDA stack reuses the compiler and compiler view of the GCC stack.
+            if family != "gcc" or release not in known_gcc:
+                raise ValueError("cuda_arch requires a GCC release that is also a GCC stack")
+            if "cuda" not in gpu:
+                raise ValueError("cuda_arch requires gpu.cuda")
+            arch = item["cuda_arch"]
+            if not isinstance(arch, str) or not re.fullmatch(r"\d+[af]?(?:,\d+[af]?)*", arch):
+                raise ValueError(f"cuda_arch must be like \"89\" or \"80,90a\", got {arch!r}")
+            item["cuda"] = gpu["cuda"]
+        overrides = item.get("dependencies", {})
+        if not isinstance(overrides, dict) or set(overrides) - set(DEPENDENCIES):
+            raise ValueError(f"{family}/{release} dependencies may override only: "
+                             + ", ".join(DEPENDENCIES))
+        item["dependencies"] = dict(result["dependencies"], **{
+            name: package_version(value) for name, value in overrides.items()})
+    # A GCC stack installs the compilers that the other stacks use, and a CUDA stack reuses
+    # the compiler of its GCC stack.
+    result["compilers"] = (
+        [x for x in compilers if x["family"] == "gcc" and "cuda" not in x]
+        + [x for x in compilers if x["family"] != "gcc"]
+        + [x for x in compilers if "cuda" in x])
     return result
 
 
@@ -221,11 +254,14 @@ def stack_manifest(compiler, specs, compiler_view, stack_view, store, compiler_m
         "    specs:",
     ]
     lines += [f"    - {spec}" for spec in specs]
+    lines.append("  view:")
+    if compiler_view:
+        lines += [
+            "    compiler:",
+            f"      root: {compiler_view}",
+            "      group: compiler",
+        ]
     lines += [
-        "  view:",
-        "    compiler:",
-        f"      root: {compiler_view}",
-        "      group: compiler",
         "    stack:",
         f"      root: {stack_view}",
         "      group: stack",
@@ -274,25 +310,30 @@ def stack_manifest(compiler, specs, compiler_view, stack_view, store, compiler_m
     return "\n".join(lines)
 
 
-def dependency_specs(dependencies, mpi, compiler):
+def dependency_specs(dependencies, mpi, compiler, cuda=None):
+    """Return the stack's root specs; ``cuda`` is (release, cuda_arch) for a CUDA stack."""
     compiled_with = f"%{compiler}"
     mpi_dep = f"^mpich@{mpi}"
+    # Every dependency with CUDA support is built with it: MPICH (GPU-aware MPI), Caliper
+    # (CUPTI/NVTX services), PETSc, Hypre, and SuperLU_DIST.
+    gpu = f"+cuda cuda_arch={cuda[1]}" if cuda else ""
+    gpu_dep = f" ^cuda@{cuda[0]}" if cuda else ""
     specs = [
         f"googletest@{dependencies['googletest']} {compiled_with}",
-        f"mpich@{mpi}~fortran {compiled_with}",
+        f"mpich@{mpi}~fortran{gpu} {compiled_with}{gpu_dep}",
         f"mpicpp-lite@{dependencies['mpicpp-lite']} {compiled_with} {mpi_dep}",
         f"boost@{dependencies['boost']} {compiled_with}",
         f"hdf5@{dependencies['hdf5']}+hl+mpi {compiled_with} {mpi_dep}",
         (f"vtk@{dependencies['vtk']}+mpi io=exodusii {compiled_with} {mpi_dep} "
          f"^hdf5@{dependencies['hdf5']}"),
-        (f"caliper@{dependencies['caliper']}+mpi~gotcha~kokkos {compiled_with} "
+        (f"caliper@{dependencies['caliper']}+mpi~gotcha~kokkos{gpu} {compiled_with} "
          f"{mpi_dep}"),
     ]
     petsc = (
         f"petsc@{dependencies['petsc']}+mpi+double~complex+int64+hdf5+metis+ptscotch"
-        f"+hypre+superlu-dist~fortran {compiled_with} {mpi_dep} "
-        f"^hdf5@{dependencies['hdf5']} ^hypre@{dependencies['hypre']} "
-        f"^superlu-dist@{dependencies['superlu-dist']}~fortran "
+        f"+hypre+superlu-dist~fortran{gpu} {compiled_with} {mpi_dep} "
+        f"^hdf5@{dependencies['hdf5']} ^hypre@{dependencies['hypre']}{gpu} "
+        f"^superlu-dist@{dependencies['superlu-dist']}~fortran{gpu} "
         f"^metis@{dependencies['metis']} ^parmetis@{dependencies['parmetis']} "
         f"^scotch@{dependencies['scotch']}~fortran"
     )
@@ -321,7 +362,8 @@ def blas_packages(dependencies):
 
 
 def modulefile(family, release, mpi, compiler_view, gcc_runtime_view, view, common_view,
-               common_venv, stack_venv, python):
+               common_venv, stack_venv, python, cuda=None):
+    """Return a stack modulefile; ``cuda`` is (release, cuda_arch, toolkit view) or None."""
     cc, cxx = {"gcc": ("gcc", "g++"), "clang": ("clang", "clang++"),
                "oneapi": ("icx", "icpx")}[family]
     compiler_bin = (compiler_view / "compiler" / "latest" / "bin"
@@ -340,10 +382,25 @@ def modulefile(family, release, mpi, compiler_view, gcc_runtime_view, view, comm
             f"prepend-path LIBRARY_PATH {root}/lib",
             f"prepend-path OCL_ICD_FILENAMES {root}/lib/libintelocl.so",
         ]
+    cuda_lines = []
+    label = f"OpenSn {family} {release} / MPICH {mpi}"
+    if cuda:
+        cuda_release, arch, toolkit = cuda
+        label = f"OpenSn {family} {release} / CUDA {cuda_release} (cuda_arch {arch}) / MPICH {mpi}"
+        cuda_lines = [
+            f"setenv CUDA_HOME {toolkit}",
+            f"setenv CUDA_PATH {toolkit}",
+            f"setenv CUDAToolkit_ROOT {toolkit}",
+            # CMake's default for CMAKE_CUDA_ARCHITECTURES: the architectures PETSc was built for.
+            f"setenv CUDAARCHS {arch.replace(',', ';')}",
+            f"prepend-path PATH {toolkit}/bin",
+            f"prepend-path CMAKE_PREFIX_PATH {toolkit}",
+            f"prepend-path LD_LIBRARY_PATH {toolkit}/lib64",
+        ]
     return "\n".join([
         "#%Module1.0",
-        f'module-whatis "OpenSn {family} {release} / MPICH {mpi}"',
-        "conflict opensn-stack",
+        f'module-whatis "{label}"',
+        "conflict " + " ".join(f"opensn/{x}" for x in STACK_FAMILIES),
         f"setenv OPENSN_STACK {view}",
         f"setenv CC {compiler_bin}/{cc}",
         f"setenv CXX {compiler_bin}/{cxx}",
@@ -351,8 +408,11 @@ def modulefile(family, release, mpi, compiler_view, gcc_runtime_view, view, comm
         f"setenv MPICC {view}/bin/mpicc",
         f"setenv MPICXX {view}/bin/mpicxx",
         f"setenv PETSC_DIR {view}",
-        # AMD's clang++ compiles HIP code; use the stack's GCC C++ headers and libstdc++.
-        f"setenv HIPFLAGS --gcc-toolchain={gcc_runtime_view}",
+        # AMD's clang++ compiles HIP code; use the stack's GCC C++ headers and libstdc++. On
+        # NVIDIA, nvcc compiles HIP code and rejects this option.
+        "if {![info exists ::env(HIP_PLATFORM)] || $::env(HIP_PLATFORM) ne \"nvidia\"} {",
+        f"  setenv HIPFLAGS --gcc-toolchain={gcc_runtime_view}",
+        "}",
         # OpenSn's style requires clang-format 19; Clang compiler views shadow it on PATH.
         f"setenv CLANG_FORMAT {common_venv}/bin/clang-format",
         f"setenv VIRTUAL_ENV {stack_venv}",
@@ -372,6 +432,7 @@ def modulefile(family, release, mpi, compiler_view, gcc_runtime_view, view, comm
         f"prepend-path LD_LIBRARY_PATH {compiler_view}/lib",
         f"prepend-path LD_LIBRARY_PATH {compiler_view}/lib64",
         *oneapi,
+        *cuda_lines,
         f"prepend-path LD_PRELOAD {gcc_runtime_view}/lib64/libstdc++.so.6",
     ])
 
@@ -388,6 +449,20 @@ def tool_modulefile(name, release, view):
 
 
 def gpu_modulefile(kind, release, view):
+    if kind == "hip_nvidia":
+        return "\n".join([
+            "#%Module1.0",
+            f'module-whatis "HIP {release} for NVIDIA GPUs (CUDA backend)"',
+            "conflict rocm hip-nvidia",
+            f"setenv HIP_PATH {view}",
+            "setenv HIP_PLATFORM nvidia",
+            "setenv HIP_COMPILER nvcc",
+            # nvcc compiles HIP code here and rejects the stack modules' AMD clang option.
+            "unsetenv HIPFLAGS",
+            f"prepend-path PATH {view}/bin",
+            f"prepend-path CMAKE_PREFIX_PATH {view}",
+            f"prepend-path LD_LIBRARY_PATH {view}/lib",
+        ])
     if kind == "cuda":
         return "\n".join([
             "#%Module1.0",
@@ -414,14 +489,23 @@ def gpu_modulefile(kind, release, view):
     ])
 
 
-def gpu_lines(kind, release, root, envs, store, jobs):
-    """Install CUDA or ROCm in its own environment, independent of every compiler stack."""
-    env = envs / f"{kind}-{release}"
-    view = root / "gpu" / kind / release / "view"
+def gpu_lines(kind, release, root, envs, store, jobs, cuda=None):
+    """Install CUDA, ROCm, or HIP on NVIDIA in its own environment, independent of every
+    compiler stack. ``cuda`` is the CUDA release that HIP on NVIDIA builds against."""
+    name = kind.replace("_", "-")
+    env = envs / f"{name}-{release}"
+    view = root / "gpu" / name / release / "view"
     if kind == "cuda":
         # NVIDIA publishes CUDA installers for x86_64 and aarch64 Linux.
         arches, specs, packages, check = ("x86_64|aarch64", [f"cuda@{release}"], None,
                                           view / "bin/nvcc")
+    elif kind == "hip_nvidia":
+        # HIP's CUDA backend: hipcc and headers that map HIP onto the installed CUDA.
+        cuda_view = root / "gpu" / "cuda" / cuda / "view"
+        arches, specs, check = ("x86_64|aarch64", [f"hip@{release}~rocm+cuda ^cuda@{cuda}"],
+                                view / "bin/hipconfig")
+        packages = ["    cuda:", "      buildable: false", "      externals:",
+                    f'      - spec: "cuda@{cuda}"', f"        prefix: {cuda_view}"]
     else:
         # Mesa is only an OpenGL provider for HIP; do not build its LLVM rasterizer.
         arches, specs, packages, check = ("x86_64", [f"hip@{release}"],
@@ -429,17 +513,43 @@ def gpu_lines(kind, release, root, envs, store, jobs):
                                           view / "bin/hipcc")
     lines = [f'case "$(uname -m)" in {arches})']
     add_file(lines, env / "spack.yaml", manifest(specs, view, store, packages=packages))
-    lines += [f"echo '==> Concretizing {kind} {release}'",
+    lines += [f"echo '==> Concretizing {name} {release}'",
               f'"$spack" -e {quote(env)} concretize -f',
-              f"echo '==> Installing {kind} {release}'",
+              f"echo '==> Installing {name} {release}'",
               f'"$spack" -e {quote(env)} install -j {jobs}',
               f'"$spack" -e {quote(env)} env view regenerate',
               f"{quote(check)} --version >/dev/null"]
-    add_file(lines, root / "modules" / kind / release, gpu_modulefile(kind, release, view))
+    add_file(lines, root / "modulefiles" / name / release, gpu_modulefile(kind, release, view))
     return lines + [
         ";;",
-        f"*) echo '==> Skipping {kind} {release}: not available for '\"$(uname -m)\" ;;",
+        f"*) echo '==> Skipping {name} {release}: not available for '\"$(uname -m)\" ;;",
         "esac",
+    ]
+
+
+def blas_check_lines(env, view, label):
+    """Check that the installed PETSc links the BLAS/LAPACK the manifest requires.
+
+    On x86_64, PETSc must load oneMKL's LP64 interface, sequential threading, and core
+    libraries from this environment's intel-oneapi-mkl, and no OpenBLAS. Elsewhere, where
+    oneMKL does not exist, it must load OpenBLAS.
+    """
+    petsc = quote(view / "lib/libpetsc.so")
+    fail = f"echo 'PETSc in {label}' \"$1\" >&2; exit 1"
+    return [
+        f"petsc_libs=$(ldd {petsc})",
+        "blas_fail() { " + fail + "; }",
+        'if [[ $(uname -m) == x86_64 ]]; then',
+        f'  mkl=$(realpath "$("$spack" -e {quote(env)} location -i intel-oneapi-mkl)")',
+        "  for lib in libmkl_intel_lp64 libmkl_sequential libmkl_core; do",
+        '    path=$(awk -v lib="$lib" \'index($1, lib ".so") == 1 {print $3}\' <<<"$petsc_libs")',
+        '    [[ -n $path && $(realpath "$path") == "$mkl"/* ]] ||',
+        '      blas_fail "does not load $lib from $mkl"',
+        "  done",
+        '  ! grep -q libopenblas <<<"$petsc_libs" || blas_fail "loads OpenBLAS"',
+        "else",
+        '  grep -q libopenblas <<<"$petsc_libs" || blas_fail "does not load OpenBLAS"',
+        "fi",
     ]
 
 
@@ -452,10 +562,11 @@ def prune_lines(root, envs, stacks, compilers):
     """Remove stack environments, views, and modules that are no longer configured.
 
     ``stacks`` holds the configured environment names and ``compilers`` the configured
-    FAMILY/RELEASE pairs. Every remaining environment directory protects its packages
-    (including build dependencies) from garbage collection.
+    module FAMILY/RELEASE pairs (``gcc-cuda`` for a CUDA stack). Every remaining environment
+    directory protects its packages (including build dependencies) from garbage collection.
     """
-    opensn, compiler_root, modules = root / "opensn", root / "compilers", root / "modules"
+    opensn, compiler_root = root / "opensn", root / "compilers"
+    modules = root / "modulefiles" / "opensn"
     return [
         "echo '==> Pruning stacks that are no longer configured'",
         "keep_stacks=" + quote(" " + " ".join(stacks) + " "),
@@ -464,17 +575,22 @@ def prune_lines(root, envs, stacks, compilers):
         '  [[ -d $env_dir ]] || continue',
         '  name=$(basename "$env_dir")',
         '  [[ $keep_stacks == *" $name "* ]] && continue',
-        '  if [[ ! $name =~ ^(gcc|clang|oneapi)-([0-9.]+)-mpich-([0-9.]+)$ ]]; then',
+        ('  if [[ ! $name =~ '
+         '^(gcc|clang|oneapi)-([0-9.]+)(-cuda-([0-9.]+))?-mpich-([0-9.]+)$ ]]; then'),
         '    echo "Skipping unrecognized environment $name" >&2',
         "    continue",
         "  fi",
-        '  family=${BASH_REMATCH[1]} release=${BASH_REMATCH[2]} mpi=${BASH_REMATCH[3]}',
+        '  family=${BASH_REMATCH[1]} release=${BASH_REMATCH[2]} cuda=${BASH_REMATCH[4]}',
+        '  mpi=${BASH_REMATCH[5]}',
+        '  stack=mpich-$mpi module=$family',
+        '  [[ -n $cuda ]] && stack=cuda-$cuda-mpich-$mpi module=$family-cuda',
         '  echo "==> Removing stack $name"',
-        f'  rm -rf -- "$env_dir" {quote(opensn)}/"$family/$family-$release/mpich-$mpi"',
+        f'  rm -rf -- "$env_dir" {quote(opensn)}/"$family/$family-$release/$stack"',
         f'  rmdir {quote(opensn)}/"$family/$family-$release" 2>/dev/null || true',
-        '  if [[ $keep_compilers != *" $family/$release "* ]]; then',
-        f'    rm -rf -- {quote(compiler_root)}/"$family/$release" '
-        f'{quote(modules)}/"$family/$release"',
+        '  if [[ $keep_compilers != *" $module/$release "* ]]; then',
+        f'    rm -f -- {quote(modules)}/"$module/$release"',
+        # A CUDA stack shares the compiler view of its GCC stack.
+        f'    [[ -n $cuda ]] || rm -rf -- {quote(compiler_root)}/"$family/$release"',
         "  fi",
         "done",
         "keep_envs=()",
@@ -561,20 +677,25 @@ def generate(config):
                   f'"$spack" -e {quote(tool_env)} install -j {config["jobs"]}',
                   f'"$spack" -e {quote(tool_env)} env view regenerate',
                   f"{quote(tool_view / 'bin' / name)} --version >/dev/null"]
-        add_file(lines, root / "modules" / name / release,
+        add_file(lines, root / "modulefiles" / name / release,
                  tool_modulefile(name, release, tool_view))
-    for kind, release in config["gpu"].items():
-        lines += gpu_lines(kind, release, root, envs, store, config["jobs"])
+    for kind in GPU_KINDS:
+        if kind in config["gpu"]:
+            lines += gpu_lines(kind, config["gpu"][kind], root, envs, store, config["jobs"],
+                               config["gpu"].get("cuda"))
     py_site = "lib/python" + ".".join(config["python"].split(".")[:2]) + "/site-packages"
     stacks, compilers = [], []
     for item in config["compilers"]:
         family, release, mpi = item["family"], item["version"], item["mpich"]
-        stacks.append(f"{family}-{release}-mpich-{mpi}")
-        compilers.append(f"{family}/{release}")
-        prefix = root / "opensn" / family / f"{family}-{release}" / f"mpich-{mpi}"
+        cuda = item.get("cuda")
+        stack = f"cuda-{cuda}-mpich-{mpi}" if cuda else f"mpich-{mpi}"
+        module = f"{family}-cuda" if cuda else family
+        stacks.append(f"{family}-{release}-{stack}")
+        compilers.append(f"{module}/{release}")
+        prefix = root / "opensn" / family / f"{family}-{release}" / stack
         view = prefix / "view"
         stack_venv = prefix / "venv"
-        stack_env = envs / f"{family}-{release}-mpich-{mpi}"
+        stack_env = envs / f"{family}-{release}-{stack}"
         compiler_prefix = root / "compilers" / family / release
         compiler_view = compiler_prefix / "view"
         bootstrap_view = None
@@ -583,6 +704,10 @@ def generate(config):
             ("cmake", f'cmake@{config["dependencies"]["cmake"]}', python_view, None),
             ("gmake", f'gmake@{config["dependencies"]["gmake"]}', python_view, None),
         ]
+        cuda_view = root / "gpu" / "cuda" / cuda / "view" if cuda else None
+        if cuda:
+            # Build against the CUDA toolkit that the cuda module and HIP on NVIDIA use.
+            externals.append(("cuda", f"cuda@{cuda}", cuda_view, None))
         if family == "gcc":
             compiler = f"gcc@{release} languages:=c,c++"
             compiler_ref = f"gcc@{release}"
@@ -620,20 +745,30 @@ def generate(config):
             compiler = f"intel-oneapi-compilers@{release} %gcc@{item['gcc_toolchain']}"
             compiler_ref = f"intel-oneapi-compilers@{release}"
             compiler_mixing = False
-        specs = dependency_specs(config["dependencies"], mpi, compiler_ref)
+        specs = dependency_specs(item["dependencies"], mpi, compiler_ref,
+                                 (cuda, item["cuda_arch"]) if cuda else None)
         if bootstrap_view:
             tools = [bootstrap_view / "bin" / name for name in ("gcc", "g++")]
             checks = " && ".join(f"[[ -x {quote(path)} ]]" for path in tools)
             lines.append(f"{checks} || {{ echo 'Missing GCC bootstrap view: "
                          f"{bootstrap_view}' >&2; exit 1; }}")
+        if cuda:
+            # NVIDIA publishes CUDA only for x86_64 and aarch64 Linux.
+            lines += ['case "$(uname -m)" in x86_64|aarch64)',
+                      f"[[ -x {quote(cuda_view / 'bin/nvcc')} ]] || {{ echo 'Missing CUDA "
+                      f"view: {cuda_view}' >&2; exit 1; }}"]
+        # The CUDA stack's compiler view is the one its GCC stack maintains.
         add_file(lines, stack_env / "spack.yaml",
-                 stack_manifest(compiler, specs, compiler_view, view, store,
+                 stack_manifest(compiler, specs, None if cuda else compiler_view, view, store,
                                 compiler_mixing, reuse_specs, externals,
-                                blas_packages(config["dependencies"]), bootstrap))
+                                blas_packages(item["dependencies"]), bootstrap))
         mpi_test = ("import h5py, numpy; assert not h5py.get_config().mpi; "
                     "from mpi4py import MPI; assert MPI.COMM_WORLD.size == 2; "
                     "assert 'MPICH' in MPI.Get_library_version()")
-        label = f"{family} {release} / MPICH {mpi}"
+        if cuda:
+            # GPU-aware MPI: MPICH reports its configure options, as OpenSn's CMake check reads.
+            mpi_test += "; assert '--with-cuda' in MPI.Get_library_version()"
+        label = f"{family} {release} / " + (f"CUDA {cuda} / " if cuda else "") + f"MPICH {mpi}"
         lines += [f"echo '==> Concretizing {label}'",
                   f'"$spack" -e {quote(stack_env)} concretize -f']
         # Intel's offline installers clean up files under /tmp/$USER, including other packages'
@@ -647,6 +782,7 @@ def generate(config):
                   f"echo '==> Installing {label}'",
                   f'"$spack" -e {quote(stack_env)} install -j {config["jobs"]}',
                   f'"$spack" -e {quote(stack_env)} env view regenerate',
+                  *blas_check_lines(stack_env, view, label),
                   f"{quote(python_view / 'bin/python3')} -m venv {quote(stack_venv)}",
                   f"{quote(stack_venv / 'bin/python')} -m pip install --upgrade "
                   "pip setuptools wheel",
@@ -656,10 +792,16 @@ def generate(config):
         add_file(lines, stack_venv / py_site / "opensn-common.pth", str(common_venv / py_site))
         lines.append(f"{quote(view / 'bin/mpiexec')} -n 2 "
                      f"{quote(stack_venv / 'bin/python')} -c {quote(mpi_test)}")
-        add_file(lines, root / "modules" / family / release,
+        add_file(lines, root / "modulefiles" / "opensn" / module / release,
                  modulefile(family, release, mpi, compiler_view,
                             compiler_view if family == "gcc" else bootstrap_view, view, python_view,
-                            common_venv, stack_venv, config["python"]))
+                            common_venv, stack_venv, config["python"],
+                            (cuda, item["cuda_arch"], cuda_view) if cuda else None))
+        if cuda:
+            lines += [";;",
+                      f"*) echo '==> Skipping {label}: CUDA is not available for '"
+                      '"$(uname -m)" ;;',
+                      "esac"]
     if config["prune"]:
         lines += prune_lines(root, envs, stacks, compilers)
     return "\n".join(lines) + "\n"

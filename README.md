@@ -67,14 +67,18 @@ views and modules hide that store from users:
 /opt/local/tools/TOOL/X.Y.Z/view/          shared Doxygen or Pandoc view
 /opt/local/gpu/cuda/X.Y.Z/view/            optional CUDA toolkit view
 /opt/local/gpu/rocm/X.Y.Z/view/            optional ROCm/HIP toolkit view
+/opt/local/gpu/hip-nvidia/X.Y.Z/view/      optional HIP for NVIDIA (CUDA backend)
 /opt/local/compilers/FAMILY/X.Y.Z/view/    compiler view
 /opt/local/opensn/FAMILY/FAMILY-X.Y.Z/
     mpich-M.Y.Z/view/                      MPI and OpenSn dependencies
     mpich-M.Y.Z/venv/                      stack-specific mpi4py environment
-/opt/local/modules/FAMILY/X.Y.Z            public modulefile
-/opt/local/modules/TOOL/X.Y.Z              public tool modulefile
-/opt/local/modules/cuda/X.Y.Z              public CUDA modulefile
-/opt/local/modules/rocm/X.Y.Z              public ROCm modulefile
+    cuda-C.Y.Z-mpich-M.Y.Z/view/           optional CUDA stack (GCC only)
+/opt/local/modulefiles/opensn/FAMILY/X.Y.Z public stack modulefile (gcc, clang, oneapi)
+/opt/local/modulefiles/opensn/gcc-cuda/X.Y.Z  public CUDA stack modulefile
+/opt/local/modulefiles/TOOL/X.Y.Z          public tool modulefile (doxygen, pandoc)
+/opt/local/modulefiles/cuda/X.Y.Z          public CUDA modulefile
+/opt/local/modulefiles/rocm/X.Y.Z          public ROCm modulefile
+/opt/local/modulefiles/hip-nvidia/X.Y.Z    public HIP-on-NVIDIA modulefile
 ```
 
 Each compiler and its dependency stack are separate Spack spec groups in one
@@ -115,11 +119,16 @@ shared environment. It also installs `documentation-requirements.txt` by
 default for Sphinx documentation and notebook tutorials. Each stack has a small
 virtual environment where pip builds `mpi4py` from source with that stack's
 `mpicc`; a `.pth` file makes the shared packages available there. CUDA and ROCm
-are excluded. Clang optionally includes X86 and NVPTX. Each stack manifest
+are excluded, except in a CUDA stack (below). Clang optionally includes X86 and NVPTX. Each stack manifest
 requires PETSc, Hypre, and SuperLU_DIST to use oneMKL or OpenBLAS for BLAS and
 LAPACK, and requires oneMKL on x86_64 targets (sequential, LP64, no Fortran
 interface layer). oneMKL exists only for x86_64 Linux, so other architectures
-use `openblas~fortran`, which builds an f2c-converted LAPACK.
+use `openblas~fortran`, which builds an f2c-converted LAPACK. After installing
+each stack, including a CUDA stack, the script checks the result with `ldd` on
+the stack's `libpetsc.so`. On x86_64, PETSc must load `libmkl_intel_lp64`,
+`libmkl_sequential`, and `libmkl_core` from that environment's
+`intel-oneapi-mkl` installation and must not load OpenBLAS; elsewhere it must
+load OpenBLAS.
 
 GCC build environments override inherited GCC externals with an empty list.
 This prevents a compiler discovered from a previously generated module or view
@@ -138,32 +147,36 @@ with any OpenSn development stack and upgraded independently.
 
 ## GPU toolkits
 
-The optional `gpu` object installs the CUDA toolkit, the ROCm HIP toolkit, or
-both, each in its own Spack environment like Doxygen and Pandoc. They belong to
-no compiler stack:
+The optional `gpu` object installs the CUDA toolkit, the ROCm HIP toolkit, and
+HIP for NVIDIA GPUs, each in its own Spack environment like Doxygen and Pandoc.
+They belong to no compiler stack:
 
 ```json
-"gpu": {"cuda": "latest", "rocm": "latest"}
+"gpu": {"cuda": "latest", "rocm": "latest", "hip_nvidia": "latest"}
 ```
 
 Each value is an exact release or `latest`, which `install.py` resolves to the
 newest release in the recipes at `spack.packages_ref` when it generates the
-script (CUDA 13.4.1 and ROCm 10.0.0 at the default commit). Omit a key, or the
-whole object, to skip that toolkit. Spack installs NVIDIA's CUDA binary
+script (CUDA 13.4.1 and ROCm/HIP 10.0.0 at the default commit). Omit a key, or
+the whole object, to skip that toolkit. `hip_nvidia` requires `cuda`. Spack installs NVIDIA's CUDA binary
 installer, so CUDA needs no compiler and is installed on x86_64 and aarch64.
 ROCm is built from source, which takes several hours because it includes AMD's
 LLVM; like the Doxygen and Pandoc environments, its environment names no
 compiler, so Spack chooses one of the available GCCs. It is installed only on
-x86_64. The script
-skips a toolkit on other architectures. Old releases are not pruned.
+x86_64. HIP for NVIDIA is Spack's `hip~rocm+cuda`: HIP's headers and `hipcc` on
+top of CUDA, built against the installed CUDA toolkit and without AMD's LLVM. It
+is installed on x86_64 and aarch64. The script skips a toolkit on other
+architectures. Old releases are not pruned.
 
 The CUDA module sets `CUDA_HOME`, `CUDA_PATH`, and `CUDAToolkit_ROOT`. The ROCm
 module sets `ROCM_PATH`, `HIP_PATH`, `HIP_PLATFORM=amd`, and `HIPCXX` (AMD's
-`clang++`). Both add the toolkit to `PATH`, `CMAKE_PREFIX_PATH`, and
-`LD_LIBRARY_PATH`. Load one together with a stack module:
+`clang++`). The HIP-on-NVIDIA module sets `HIP_PATH`, `HIP_PLATFORM=nvidia`,
+and `HIP_COMPILER=nvcc`, and unsets `HIPFLAGS` (below). All three add the
+toolkit to `PATH`, `CMAKE_PREFIX_PATH`, and `LD_LIBRARY_PATH`. Load one together
+with a stack module:
 
 ```sh
-module load gcc/16.2.0 cuda/13.4.1
+module load opensn/gcc/16.2.0 cuda/13.4.1
 cmake -S . -B build-cuda -DOPENSN_WITH_CUDA=ON \
   -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" -DOPENSN_WITH_PYTHON_MODULE=ON
 ```
@@ -180,7 +193,60 @@ Each stack module therefore sets `HIPFLAGS=--gcc-toolchain=GCC_VIEW`, naming the
 same GCC whose `libstdc++` the module preloads: the stack's own GCC, or the
 `gcc_toolchain` of a Clang or oneAPI stack. CMake reads `HIPFLAGS` only when it
 first configures a build directory, so load the modules before configuring, and
-reconfigure an existing HIP build directory from scratch.
+reconfigure an existing HIP build directory from scratch. On NVIDIA, `nvcc`
+compiles HIP code and rejects `--gcc-toolchain`, so a stack module does not set
+`HIPFLAGS` when `HIP_PLATFORM` is `nvidia`, and the HIP-on-NVIDIA module unsets
+it. Load `hip-nvidia` before or after the stack module.
+
+## CUDA stack
+
+A GCC entry with `cuda_arch` adds a second stack for that GCC in which every
+OpenSn dependency with CUDA support is built with it: MPICH (GPU-aware MPI),
+Caliper (CUPTI and NVTX services), PETSc, Hypre, and SuperLU_DIST. Hypre's CUDA
+build also brings in Umpire. The other dependencies have no CUDA support.
+
+Only this stack has GPU-aware MPI; the CPU stacks build MPICH with
+`--without-cuda`. Spack configures the CUDA stack's MPICH with
+`--with-cuda=PREFIX`, and after installing it the script checks that
+`MPI_Get_library_version` reports that option, which is what OpenSn's CMake
+check reads. Build OpenSn with `-DOPENSN_USE_GPU_AWARE_MPI=ON` to pass device
+buffers to MPI. MPICH enables its GPU support at run time by default
+(`MPIR_CVAR_ENABLE_GPU=1`).
+
+```json
+"gpu": {"cuda": "latest"},
+"compilers": [
+  {"family": "gcc", "version": "latest-3"},
+  {"family": "gcc", "version": "latest", "cuda_arch": "89",
+   "dependencies": {"hypre": "3.2.0"}}
+]
+```
+
+- `cuda_arch` is the Spack CUDA architecture list, such as `"89"` or
+  `"80,90a"`. The module sets `CUDAARCHS` to it, so CMake builds OpenSn for the
+  same architectures unless `CMAKE_CUDA_ARCHITECTURES` is given.
+- The stack uses `gpu.cuda`, registered as an external, so PETSc, the `cuda`
+  module, and HIP on NVIDIA share one toolkit. CUDA is installed only on x86_64
+  and aarch64, and the script skips the CUDA stack on other architectures.
+- The GCC must also be a plain GCC stack, whose compiler and compiler view the
+  CUDA stack reuses. `latest` selects the newest configured GCC. The CUDA
+  release must support it as a host compiler (CUDA 13.4 supports GCC up to 16);
+  Spack's CUDA conflicts reject an unsupported pair when concretizing.
+- `dependencies` in any compiler entry overrides versions for that stack only.
+  Hypre 3.1.0 and earlier conflict with CUDA 13.2 and later, so the example
+  builds this stack with Hypre 3.2.0 while the CPU stacks keep the project
+  default.
+
+The stack lives in `opensn/gcc/gcc-X.Y.Z/cuda-C.Y.Z-mpich-M.Y.Z` with its own
+`mpi4py` environment, and its module is `opensn/gcc-cuda/X.Y.Z`. The module also
+sets `CUDA_HOME`, `CUDA_PATH`, and `CUDAToolkit_ROOT`, so it does not need the
+`cuda` module:
+
+```sh
+module use /opt/local/modulefiles
+module load opensn/gcc-cuda/16.2.0
+cmake -S . -B build-cuda -DOPENSN_WITH_CUDA=ON -DOPENSN_WITH_PYTHON_MODULE=ON
+```
 
 The public module preloads the selected GCC toolchain's ``libstdc++``. Binary
 Python packages in the shared environment can contain an RPATH to the older
@@ -214,8 +280,8 @@ notebook tutorials.
 Users need only Environment Modules or Lmod:
 
 ```sh
-module use /opt/local/modules
-module load gcc/16.2.0
+module use /opt/local/modulefiles
+module load opensn/gcc/16.2.0
 module load doxygen/1.17.0 pandoc/3.7.0.2
 cmake -S . -B build-gcc -DOPENSN_WITH_PYTHON_MODULE=ON \
   -DPython3_EXECUTABLE="$Python3_EXECUTABLE"
@@ -229,7 +295,10 @@ installs in the shared environment, the version OpenSn's style requires. Use
 `"$CLANG_FORMAT"` rather than `clang-format`: in a Clang module, the compiler's
 own, newer `clang-format` comes first on `PATH`.
 
-Use a separate OpenSn build directory for every module. The module selects the
+Stack modules are `opensn/gcc/X.Y.Z`, `opensn/clang/X.Y.Z`,
+`opensn/oneapi/X.Y.Z`, and `opensn/gcc-cuda/X.Y.Z`. They conflict with one
+another, so unload one stack before loading another. Use a separate OpenSn
+build directory for every module. The module selects the
 stack virtual environment and its matching `mpi4py`; users never run Spack or
 activate a Python or Spack environment.
 
@@ -250,7 +319,8 @@ spack=/opt/local/.spack/spack/bin/spack
 ```
 
 The environments are under `/opt/local/.spack/environments`:
-`FAMILY-X.Y.Z-mpich-M.Y.Z` for each stack, `python-P.Y.Z` for the shared
+`FAMILY-X.Y.Z-mpich-M.Y.Z` for each stack (`gcc-X.Y.Z-cuda-C.Y.Z-mpich-M.Y.Z`
+for a CUDA stack), `python-P.Y.Z` for the shared
 Python environment, and `doxygen-X.Y.Z` and `pandoc-X.Y.Z` for the tools.
 
 ```sh
@@ -402,12 +472,15 @@ configuration, for example because a newer `spack.packages_ref` moves a
 environment, and module remain usable. Set `"prune": true` to remove them.
 After every configured stack installs successfully, the script then:
 
-1. removes each `FAMILY-X.Y.Z-mpich-M.Y.Z` environment that is not configured,
-   together with its `opensn/FAMILY/FAMILY-X.Y.Z/mpich-M.Y.Z` view and virtual
-   environment;
-2. removes the compiler view and module of each removed stack whose compiler
-   is no longer configured at all (a stack that only changed MPICH versions
-   keeps them); and
+1. removes each `FAMILY-X.Y.Z-mpich-M.Y.Z` or
+   `gcc-X.Y.Z-cuda-C.Y.Z-mpich-M.Y.Z` environment that is not configured,
+   together with its view and virtual environment under
+   `opensn/FAMILY/FAMILY-X.Y.Z`;
+2. removes the module (`modulefiles/opensn/FAMILY/X.Y.Z`, or
+   `modulefiles/opensn/gcc-cuda/X.Y.Z`) of each removed stack that is no longer
+   configured at all, and for a removed CPU stack also its compiler view (a
+   stack that only changed MPICH or CUDA versions keeps them; a CUDA stack never
+   removes the compiler view of its GCC stack); and
 3. runs `spack gc -b`, keeping every package, including build dependencies,
    that any remaining environment under `root/.spack/environments` needs.
 
